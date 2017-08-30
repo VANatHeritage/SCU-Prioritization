@@ -1,34 +1,35 @@
+# ----------------------------------------------------------------------------------------
+# scu-FX.py
+# Version:  ArcGIS 10.3.1 / Python 2.7.8
+# Creation Date: 2017-08-29
+# Last Edit: 2017-08-30
+# Creator(s):  Kirsten R. Hazler
+
+# Summary:
+# A library of functions for prioritizing Stream Conservation Units (SCUs) for conservation.
+
+# Usage Tips:
+# 
+
+# Dependencies:
+# 
+
+# Syntax:  
+# 
+# ----------------------------------------------------------------------------------------
+
 # Import modules
 import arcpy
 from arcpy.sa import *
 arcpy.CheckOutExtension("Spatial")
+import libConSiteFx
+from libConSiteFx import *
 import os, sys, datetime, traceback
 
 # Set overwrite option so that existing data may be overwritten
 arcpy.env.overwriteOutput = True
 
-def printMsg(msg):
-   arcpy.AddMessage(msg)
-   print msg
-
-def printWrng(msg):
-   arcpy.AddWarning(msg)
-   print 'Warning: ' + msg
-
-def printErr(msg):
-   arcpy.AddError(msg)
-   print 'Error: ' + msg
-
-def multiMeasure(meas, multi):
-   '''Given a measurement string such as "100 METERS" and a multiplier, multiplies the number by the specified multiplier, and returns a new measurement string along with its individual components'''
-   parseMeas = meas.split(" ") # parse number and units
-   num = float(parseMeas[0]) # convert string to number
-   units = parseMeas[1]
-   num = num * multi
-   newMeas = str(num) + " " + units
-   measTuple = (num, units, newMeas)
-   return measTuple
-
+# Define functions used to create toolbox tools
 def delineatePolyCatchments(in_Feats, fld_ID, in_FlowDir, out_Catch, maxDist = '500 METERS', out_Scratch = 'in_memory'):
    """Delineates catchments individually for each polygon in feature class or layer, out to a maximum distance"""
    # Get cell size and output spatial reference from in_FlowDir
@@ -63,6 +64,7 @@ def delineatePolyCatchments(in_Feats, fld_ID, in_FlowDir, out_Catch, maxDist = '
    myFailList = []
 
    # Set up processing cursor and loop
+   flags = [] # Initialize empty list to keep track of suspects
    cursor = arcpy.da.UpdateCursor(out_Catch, [fld_ID, "SHAPE@"])
    for row in cursor:
       try:
@@ -95,6 +97,7 @@ def delineatePolyCatchments(in_Feats, fld_ID, in_FlowDir, out_Catch, maxDist = '
          arcpy.env.extent = clp_FlowDir
 
          # Create catchment
+         # NOTE: May want to replace this procedure with an implementation of flow distance 
          printMsg('Delineating catchment...')
          catchRast = Watershed (clp_FlowDir, srcRast)
          catchRast.save(out_Scratch + os.sep + 'catchRast')
@@ -110,9 +113,28 @@ def delineatePolyCatchments(in_Feats, fld_ID, in_FlowDir, out_Catch, maxDist = '
          arcpy.Buffer_analysis (tmpFeat, clipBuff, maxDist, "", "", "ALL", "")
          clipCatch = out_Scratch + os.sep + 'clipCatch'
          arcpy.Clip_analysis (catchPoly, clipBuff, clipCatch)
+         
+         # Eliminate parts because some features will make you cry/scream if you don't
+         printMsg('Eliminating trivial parts of catchment polygon...')
+         elimCatch = out_Scratch + os.sep + 'elimCatch'
+         arcpy.EliminatePolygonPart_management (clipCatch, elimCatch, "PERCENT", "", 10, "ANY")
 
+         # Coalesce to assure final catchment is a nice smooth feature
+         printMsg('Smoothing catchment...')
+         dist = float(cellSize)
+         dilDist = "%s %ss" % (str(dist), linUnit)
+         coalCatch = out_Scratch + os.sep + 'coalCatch'
+         Coalesce(elimCatch, dilDist, coalCatch, out_Scratch)
+         
+         # Check the number of features at this point. 
+         # It should be just one. If more, the output is likely bad and should be flagged.
+         count = countFeatures(coalCatch)
+         if count > 1:
+            printWrng('Output is suspect for feature %s' % str(myID))
+            flags.append(myID)
+         
          # Use the catchment geometry as the final shape
-         myFinalShape = arcpy.SearchCursor(clipCatch).next().Shape
+         myFinalShape = arcpy.SearchCursor(elimCatch).next().Shape
 
          # Update the feature with its final shape
          row[1] = myFinalShape
@@ -140,12 +162,34 @@ def delineatePolyCatchments(in_Feats, fld_ID, in_FlowDir, out_Catch, maxDist = '
 
          # Add status message
          printMsg("\nMoving on to the next feature.  Note that the output will be incomplete.")
+   
+   if len(flags) > 0:
+      printWrng('These features may be incorrect: %s' % str(flags))
    return out_Catch
 
+def prioritizeSCUs(in_SCU, in_Catch, fld_ID, fld_BRANK, lo_BRANK, in_Integrity, in_ConsPriority, in_Vulnerability, out_SCU, out_Scratch = 'in_memory'):
+   '''Prioritizes Stream Conservation Units (SCUs) for conservation, based on biodiversity rank (BRANK), watershed integrity and conservation priority (from ConservationVision Watershed Model), and vulnerability (from ConservationVision Development Vulnerability Model)'''
+   # Step 1: First cut based on BRANK: Create subset of SCUs ranked lo_BRANK or better
+   selQry = "%s <= '%s'" % (fld_BRANK, lo_BRANK)
+   arcpy.Select_analysis (in_SCU, out_SCU, selQry)
+   
+   # Step 2: For each SCU catchment corresponding to SCUs in subset, get zonal stats of Watershed Integrity, Conservation Priority and Vulnerability. Do this in loop in case of catchment overlap.
+   # Process: Add fields (WtrshdInteg, ConsPrior, and Vuln)
+   
+   # Set up cursor for loop
+   #for s in SCUs:
+      # Process: Select (catchment)
+      # Process: Zonal statistics by table (Watershed Integrity)
+      # Get mean value and update ConsPrior field
+      # Process: Zonal statistics by table (Conservation Priority)
+      # Get mean value and update ConsPrior field
+      # Process: Zonal statistics by table (Vulnerability)
+      # Get mean value and update Vuln field
 
-# Use the main function to run the catchment function directly from Python IDE with hard-coded variables
+   # Step 3: Score catchments based on BRANK, Watershed Integrity, Conservation Priority, and Vulnerability, then rank
+
+# Use the main function below to run the catchment function directly from Python IDE with hard-coded variables
 def main():
-   # Set up your variables here
    in_Feats = r'C:\Users\xch43889\Documents\Working\SCU_prioritization\SCUs20170724.shp\dk_1500912213976.shp'
    fld_ID = 'lngID'
    in_FlowDir = r'H:\Backups\DCR_Work_DellD\GIS_Data_VA_proc\Finalized\NHDPlus_Virginia.gdb\fdir_VA'
